@@ -1,4 +1,4 @@
-#' # Model parameters: Xylem Vulnerability Curves
+#' # Model fit: Xylem Vulnerability Curves
 #' 
 #' ### Author: German Vargas G.
 #' 
@@ -10,7 +10,8 @@ library(runjags)
 load.module('dic')
 library(mcmcplots)
 library(bayestestR)
-library(fitplc)
+#devtools::install_github("fellmk/PostJAGS/postjags")
+library(postjags)
 
 # Load custom functions ----
 set.seed(123)
@@ -23,22 +24,29 @@ plc_curves <- read.csv("data_clean/CavitronDataClean.csv",row.names = "X")# load
 plc_curves <- plc_curves[,c("Sample_ref_1","Sample_ref_2","Raw_conductance_kg_Mpa_s","Conductivity_SI_corrT","Pressure_Mpa","kmax","Ksmax","PLCclean")]# select columns of interest
 
 # Extract Tree.No and sample Replicate
-plc_curves$Tree.No <- trunc(plc_curves$Sample_ref_1)# extract tree number
-plc_curves$Rep <- plc_curves$Sample_ref_1# extract replicate number
-plc_curves$Rep <- ifelse(test = (plc_curves$Rep - plc_curves$Tree.No)*10==0, yes = 1, no = (plc_curves$Rep - plc_curves$Tree.No)*10)# fix replicate number
+plc_curves$Tree.No <- as.numeric(x = gsub(pattern = "\\..*",replacement = "",x = plc_curves$Sample_ref_1))# extract tree number
+plc_curves$Rep.No <- as.numeric(x = ifelse(test = grepl(pattern = "\\.", x = plc_curves$Sample_ref_1),
+                                           yes = sub("^[^.]*\\.([^.]*)", "\\1", plc_curves$Sample_ref_1),
+                                           no = "1"))# extract replicate number
+head(plc_curves)
 
 # merge data with genotype information
 sample_id <- read.csv("data_clean/dbg_cottonwood_plantID.csv")# load sample id information
 plc_curves <- merge(x = plc_curves, y = sample_id, by = "Tree.No", all.x = TRUE)# merge sample id information with plc data
-plc_curves$sample.id <- paste(plc_curves$Tree.No,plc_curves$Rep,sep = "-")# create sample id
-head(plc_curves)
+plc_curves$sample.id <- paste(plc_curves$Popn.Geno,plc_curves$Tree.No,plc_curves$Rep,sep = "-")# create sample id
+plc_curves <- plc_curves[,c("Population","Genotype","Popn.Geno","Tree.No","Rep.No","sample.id","Elevation.m","Pressure_Mpa","PLCclean")]# select columns of interest
+plc_curves <- plc_curves %>% arrange(Population,Genotype,Tree.No,Rep.No,desc(Pressure_Mpa))# arrange data
+plc_curves2 <- plc_curves %>% group_by(Population,Genotype,Popn.Geno,Tree.No,Rep.No,sample.id,Elevation.m,Pressure_Mpa) %>%
+  summarise(PLCclean = mean(PLCclean,na.rm = T)) %>% # summarise data
+  arrange(Population,Genotype,Tree.No,Rep.No,desc(Pressure_Mpa))# arrange data
+row.names(plc_curves2) <- NULL
+head(plc_curves2)
 
 # Quick plot of the data
-ggplot(plc_curves, aes(x = Pressure_Mpa, y = PLCclean, color = Population,group = sample.id)) + 
-  facet_wrap(~Population) +
-  geom_point(color="#000000") + 
-  geom_line(stat = "smooth",alpha=0.5,lwd=1)+
-  theme_bw()
+ggplot(plc_curves, aes(x=Pressure_Mpa, y=PLCclean, col=factor(sample.id)))+ geom_point() + 
+  geom_smooth(se=F)  + facet_wrap(~sample.id) +theme_bw() + theme(legend.position = "none") 
+ggplot(plc_curves2, aes(x=Pressure_Mpa, y=PLCclean, col=factor(sample.id)))+ geom_point() + 
+  geom_smooth(se=F)  + facet_wrap(~sample.id) +theme_bw() + theme(legend.position = "none") 
 
 # JAGS model ----
 # P12 and P50 distributions ----------------------------------------------------
@@ -48,9 +56,9 @@ xylemvc.hmodel <- "model {
   # Weibull function: - line 3
   for(i in 1:N){
     # Likelihood for observed data: - line 5
-    KSrel[i] ~ dnorm(muK[i],tau)
+    KSrel[i] ~ dnorm(muK[i],nuInv)
     # Model for replicated data: - line 7
-    KSrep[i] ~ dnorm(muK[i],tau)
+    KSrep[i] ~ dnorm(muK[i],nuInv)
     
     # Expected PLC - line 10
     # muK[i,m] <- ksat[i]*p4[i,m], this is an extra step that I don't understand why?
@@ -63,12 +71,7 @@ xylemvc.hmodel <- "model {
     Px[i] <- Tree.Px[treeID[i]]
     Sx[i] <- Tree.Sx[treeID[i]]
   }
-  
-  # Compute Bayesian R2 value
-  var.pred <- pow(sd(muK[]), 2)
-  var.resid <- 1/tau
-  R2 <- 1 - var.pred/(var.pred+var.resid)
-  
+
   # Parameter models: - line 22
   # Tree level random effects: - line 23
   for(i in 1:NTree){
@@ -91,8 +94,8 @@ xylemvc.hmodel <- "model {
   
   # Priors for standard deviation parameters, and compute associated variances
   # and precision estimates: - line 43
-  tau ~ dgamma(0.01,0.01)
-  sig <- pow(tau,-0.5)
+  nuInv <- 1/varPr
+  varPr ~ dunif(0,1)
   Px.0 ~ dnorm(0,0.001)T(0.5,)
   Sx.0 ~ dnorm(0,0.001)T(20,)
   tau.Px.Tree <- 1/pow(tau.Px,2)
@@ -125,40 +128,39 @@ xylemvc.hmodel <- "model {
 
 # Prepare data ----------------------------------------------------------------------
 ####### a. Get relative conductivity ---------------------------------------------------------
-plc_curves$KSrel <- 1-plc_curves$PLCclean/100
-ggplot(plc_curves, aes(x = Pressure_Mpa*-1, y = KSrel, color = Population,group = sample.id)) + 
+plc_curves2$KSrel <- 1-plc_curves2$PLCclean/100
+ggplot(plc_curves2, aes(x = Pressure_Mpa, y = KSrel, color = Population,group = sample.id)) + 
   facet_wrap(~Population) +
   geom_point(color="#000000") + 
   geom_line(stat = "smooth",alpha=0.5,lwd=1)+
+  ylim(-0.15,1.15) +
   theme_bw()
-row.names(plc_curves) <- NULL
-plc_curves <- droplevels(plc_curves)
-head(plc_curves)
+row.names(plc_curves2) <- NULL
+plc_curves2 <- droplevels(plc_curves2)
+head(plc_curves2)
 
 ####### b. data list for JAGS --------------------------------------------------
 # xylem vc data
 # relative conductivity and water potentials
-KSrel <- plc_curves$KSrel
-plc_curves$WP.MPa <- plc_curves$Pressure_Mpa
-MPa <- plc_curves$Pressure_Mpa*-1
+KSrel <- plc_curves2$KSrel
+MPa <- plc_curves2$Pressure_Mpa*-1
 N <- length(MPa)
 
 # level 1 : sample-level id
-plc_curves$ID <- factor(plc_curves$sample.id)
-ID <- as.numeric(plc_curves$ID)
+plc_curves2$ID <- factor(plc_curves2$sample.id,levels = unique(plc_curves2$sample.id))
+ID <- as.numeric(plc_curves2$ID)
 NTree <- length(unique(ID))
 
 # level 2: assemble model matrix for elevation band effects
-plc_curves$PopulationF <- factor(plc_curves$Population,levels = c("CCR-COL","JLA-JAK","NRV-NEW","TSZ-SAN"),
-                                 labels = c("CCR-COL","JLA-JAK","NRV-NEW","TSZ-SAN"))
-Xmat <- model.matrix(~PopulationF-1,plyr::ddply(plc_curves[,c("WP.MPa","ID","PopulationF")],~ID,plyr::catcolwise(unique)))
+plc_curves2$PopulationF <- factor(plc_curves2$Population,levels = unique(plc_curves2$Population),
+                                 labels = unique(plc_curves2$Population))
+Xmat <- model.matrix(~PopulationF-1,plyr::ddply(plc_curves2[,c("Pressure_Mpa","ID","PopulationF")],~ID,plyr::catcolwise(unique)))
 NTRT <- ncol(x = Xmat)
 
 # hyper prior deflection, used data here from the xylem FDB and the genus populus
 read.csv("data_clean/XFT_populus.csv") -> populus.p50
 GammaShRa.Px <- unlist(gammaShRaFromModeSD(mode = abs(median(x = populus.p50$P50..MPa.,na.rm = T)),
                                            sd = 2*sd(x = populus.p50$P50..MPa.,na.rm = T)))
-
 # assemble data list
 dataList <- list(KSrel = KSrel,
                  MPa = MPa, 
@@ -171,90 +173,65 @@ dataList <- list(KSrel = KSrel,
 
 ####### c. JAGS model specification --------------------------------------------------
 # parameters to monitor
-parameters <- c("P50.global","S50.global","P12.global","P50.TRT","S50.TRT","P12.TRT","KSrep")
+parameters <- c("P50.global","S50.global","P12.global","P50.TRT","S50.TRT","P12.TRT","varPr","tau.Px","tau.Sx","Px.0","Sx.0","beta.Px","beta.Sx","Tree.Px","Tree.Sx","KSrep")
 
 # initial values
-mean(sample(x = abs(populus.p50[!is.na(populus.p50$P50..MPa.),"P50..MPa."]),
-            size = length(abs(populus.p50[!is.na(populus.p50$P50..MPa.),"P50..MPa."])),replace = T))
-inits <- list()
-inits[[1]] <- list(Px.0 = 1.56, Sx.0 = 25)  
-inits[[2]] <- list(Px.0 = 1.65, Sx.0 = 28) 
-inits[[3]] <- list(Px.0 = 1.49, Sx.0 = 31) 
+# check the distribution of P50 for the genus Populus
+hist((populus.p50[!is.na(populus.p50$P50..MPa.),"P50..MPa."]))
+
+inits <- function() {
+  list(
+    varPr = runif(1, 0.001, 1), 
+    tau.Px = runif(1, 0.001, 2),
+    tau.Sx = runif(1, 0.001, 2),
+    sigma.Px.TRT = runif(1, 0.1, 2),
+    Px.0 = runif(1, 1, 4), 
+    Sx.0 = runif(1, 20, 200), 
+    beta.Px = runif(NTRT, -1, 1),
+    beta.Sx = runif(NTRT, -1, 1),
+    Tree.Px = runif(NTree, 1, 4), 
+    Tree.Sx = runif(NTree, 10, 200) 
+  )
+}
+inits_list <- list(inits(), inits(), inits(),inits())
+
+# Or, load previous saved state
+load("output/coda/inits.Rdata")
+saved_state[[2]]
 
 # chains specification. Note: modify until ESS > 10000
-thinSteps <- 10
-numSavedSteps <- 7500
-nChains <- 3
-nIter <- ceiling( ( numSavedSteps * thinSteps ) / nChains ) # estimate desired number of iterations
+thinSteps <- 150
+nIter <- 750000
+nChains <- 4
 burnInSteps <- floor(nIter/nChains)
 adaptSteps <- round(burnInSteps*0.25)
 
-# run model
-output <- run.jags(model = xylemvc.hmodel,
-                        monitor = parameters,
-                        data = dataList,
-                        n.chains = nChains,
-                        burnin = burnInSteps,
-                        sample = numSavedSteps,
-                        adapt = adaptSteps,
-                        thin = thinSteps,
-                        method = "rjags",inits = inits)
+# Initialize model
+jm <- jags.model(textConnection(xylemvc.hmodel), data = dataList, inits = inits_list, n.chains = nChains,n.adapt = adaptSteps)
+#jm <- jags.model(textConnection(xylemvc.hmodel), data = dataList, inits = saved_state[[2]], n.chains = nChains,n.adapt = adaptSteps)
 
-# make sure rhat ~ 1.0001 and ESS > 10000
-summary(output)
-vc.mcmc <- output$mcmc
-dim(vc.mcmc[[1]])
-bayesplot::mcmc_trace(vc.mcmc,pars = c("P50.global","P50.TRT[1]","P50.TRT[2]","P50.TRT[3]","P50.TRT[4]"))+theme_bw()
-bayesplot::mcmc_trace(vc.mcmc,pars = c("P12.global","P12.TRT[1]","P12.TRT[2]","P12.TRT[3]","P12.TRT[4]"))+theme_bw()
-bayesplot::mcmc_acf(vc.mcmc,pars = c("P50.global","P50.TRT[1]","P50.TRT[2]","P50.TRT[3]","P50.TRT[4]"))+theme_bw()
-bayesplot::mcmc_acf(vc.mcmc,pars =c("P12.global","P12.TRT[1]","P12.TRT[2]","P12.TRT[3]","P12.TRT[4]"))+theme_bw()
+# Monitor coda samples
+jm_coda <- coda.samples(model = jm, variable.names = parameters, n.iter = nIter, thin = thinSteps)
 
+# Save the JAGS output to an .RData file
+save(jm_coda, file = "output/coda/jm_coda.Rdata")
+load("output/coda/jm_coda.Rdata")
 
-# Plot global xylem v-curves and predicted data --------------------------------
-estimates <- data.frame(bayestestR::point_estimate(vc.mcmc,c("Median","Mean"),dispersion=T),bayestestR::ci(x=vc.mcmc,ci=0.90,method = "ETI"))
-head(estimates)
+# Visualize chains
+mcmcplot(jm_coda,parms = c("P50.global","P50.TRT","S50.global","S50.TRT","P12.global","P12.TRT"))
+mcmcplot(jm_coda,parms = c("tau.Px","tau.Sx","R2"))
+mcmcplot(jm_coda,parms = c("Px.0","Sx.0","beta.Px","beta.Sx"))
+mcmcplot(jm_coda,parms = c("Tree.Px","Tree.Sx"))
 
-mpo_pipo <- lm(plc_curves$KSrel~estimates[16:length(rownames(estimates)),"Median"])
-summary(mpo_pipo)# 0.97
+# Save state
+# newinits <- initfind(jm_coda, OpenBUGS = FALSE)
+# newinits[[1]]
+# saved_state <- removevars(initsin = newinits, 
+#                           variables = c(1:5,7,8))
+# save(saved_state, file = "output/coda/inits.Rdata")
 
-global_vcurve <- ggplot()+
-  geom_point(data = plc_curves,mapping = aes(y = KSrel,x = WP.MPa*-1),alpha=0.45,size=2.5)+
-  geom_line(mapping = aes(x = seq(from=0.5,to=5,length.out=1000),
-                          y = fweibull(P = seq(from=0.5,to=5,length.out=1000),
-                                       SX = estimates[estimates$Parameter == "S50.global","Median"],
-                                       PX = estimates[estimates$Parameter == "P50.global","Median"],X = 50)),
-            lwd=1.25,color="#3366FF")+
-  geom_rect(mapping = aes(xmin=estimates[estimates$Parameter == "P50.global","Median"]-estimates[estimates$Parameter == "P50.global","MAD"],
-                          xmax=estimates[estimates$Parameter == "P50.global","Median"]+estimates[estimates$Parameter == "P50.global","MAD"],
-                          ymin=-Inf, ymax=Inf),fill="red2",alpha=0.15)+
-  geom_vline(mapping = aes(xintercept = estimates[estimates$Parameter == "P50.global","Median"]),lwd=1.25,col="red2")+
-  annotate(geom = "text",x = 7.5,y = 0.85,label = paste("P12 =",round(estimates[estimates$Parameter == "P12.global","Median"],digits = 2),sep=" "),size=5)+
-  annotate(geom = "text",x = 7.5,y = 0.75,label = paste("P50 =",round(estimates[estimates$Parameter == "P50.global","Median"],digits = 2),sep=" "),size=5)+
-  coord_cartesian(xlim = c(-0.05,10.75),ylim = c(-0.05,1.05),expand = F)+
-  ylab(label = "Relative conductivity (0 - 1)")+
-  xlab(label = "Water potential (-MPa)")+
-  labs(title = "Populus fremontii")+
-  theme_bw()+
-  theme(axis.title.x = element_text(size = 14),
-        axis.title.y = element_text(size = 14),
-        axis.text = element_text(size=12),
-        plot.title = element_text(size = 16,hjust = 0.5,face = "bold"),
-        panel.border = element_rect(linewidth = 1.2),
-        panel.grid = element_blank())
-
-obs_pred_pipo <- ggplot(mapping = aes(y=plc_curves$KSrel,x=estimates[16:length(rownames(estimates)),"Median"]))+
-  geom_point(size=2.5,alpha=0.45)+
-  geom_abline(slope = 1,linetype=2)+
-  stat_poly_line(lwd=1.25)+
-  stat_poly_eq()+
-  ylab(label = expression(Obs.~K[rel]~("0 - 1")))+
-  xlab(label = expression(Mod.~K[rel]~("0 - 1")))+
-  ylim(c(-0.05,1.05))+
-  xlim(c(-0.05,1.05))+
-  theme_bw()+
-  theme(axis.title.x = element_text(size = 14),
-        axis.title.y = element_text(size = 14),
-        axis.text = element_text(size=12),
-        plot.title = element_text(size = 16,hjust = 0.5,face = "bold"),
-        panel.border = element_rect(linewidth = 1.2),
-        panel.grid = element_blank())
+# Check convergence
+gel <- gelman.diag(jm_coda, multivariate = FALSE)
+gel$psrf[gel$psrf[,1] > 1.01,]# still many variables are not converging. Need to increase the number of iterations
+ess <- effectiveSize(jm_coda)# check ESS
+ess[ess < 1000]

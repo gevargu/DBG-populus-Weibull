@@ -291,13 +291,13 @@ ggplot(datac, aes(x=Pressure_Mpa, y=PLCclean, col=factor(Sample_ref_1)))+ geom_p
   geom_smooth(se=F)  + facet_wrap(~Sample_ref_1) + theme(legend.position = "none")
 
 #### pulling out bad curves based on PLC
-badbranches <- c("32","3", "9","50","85") # 44 is the only questionable one. But doesn't fit with fitplc
+badbranches <- c("3","31.2","32","33","85") # 44 is the only questionable one. But doesn't fit with fitplc
 bad <- datac %>% filter(Sample_ref_1 %in% badbranches)
 good <- datac %>% filter(!Sample_ref_1 %in% badbranches)
 
 ggplot(good, aes(x=Pressure_Mpa, y=PLCclean, col=factor(Sample_ref_1)))+ geom_point() + 
   geom_smooth(se=F)  + facet_wrap(~Sample_ref_1) + theme(legend.position = "none")
 
-# save the data----
+# save the data--------------------------------
 head(good)
 write.csv(good, "data_clean/CavitronDataClean.csv")
